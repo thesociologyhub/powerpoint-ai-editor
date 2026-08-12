@@ -1,25 +1,32 @@
 from flask import Flask, request, send_file, jsonify
 from pptx import Presentation
+from openai import OpenAI
 import io
 import os
-import requests
+import json
 
 app = Flask(__name__)
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+client = OpenAI(
+    api_key=os.environ.get("OPENAI_API_KEY"),
+    timeout=90.0,
+    max_retries=2,
+)
 
 SYSTEM_PROMPT = """
 You are The Sociology Hub PowerPoint Proofreading Assistant.
 
-Your job is to make ONLY safe editorial corrections.
+Make ONLY safe editorial corrections.
 
 You MAY correct:
 - spelling
 - grammar
 - punctuation
 - obvious typos
-- accidental duplicated words
+- duplicated words
 - capitalisation consistency
+
+Use UK English.
 
 You MUST NOT change:
 - sociology content
@@ -33,39 +40,16 @@ You MUST NOT change:
 - examples
 - meaning or tone
 
-Preserve the wording as closely as possible.
+Preserve wording as closely as possible.
 
-Return ONLY the corrected text.
-Do not explain your changes.
+You will receive a numbered JSON list of PowerPoint paragraphs.
+
+Return ONLY valid JSON in exactly this format:
+
+{"items":[{"id":0,"text":"corrected text"}]}
+
+Return every supplied id exactly once and in the same order.
 """
-
-def correct_text(text):
-    if not text or not text.strip():
-        return text
-
-    response = requests.post(
-        "https://api.openai.com/v1/responses",
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": "gpt-5-mini",
-            "instructions": SYSTEM_PROMPT,
-            "input": text,
-        },
-        timeout=120,
-    )
-
-    response.raise_for_status()
-    data = response.json()
-
-    for item in data.get("output", []):
-        for content in item.get("content", []):
-            if content.get("type") == "output_text":
-                return content.get("text", text)
-
-    return text
 
 
 @app.route("/")
@@ -73,17 +57,8 @@ def home():
     return "PowerPoint AI Editor is running!"
 
 
-@app.route("/edit", methods=["POST"])
-def edit_powerpoint():
-    if "file" not in request.files:
-        return jsonify({"error": "No PowerPoint file received"}), 400
-
-    if not OPENAI_API_KEY:
-        return jsonify({"error": "OPENAI_API_KEY is not configured"}), 500
-
-    uploaded_file = request.files["file"]
-
-    presentation = Presentation(uploaded_file)
+def collect_paragraphs(presentation):
+    paragraphs = []
 
     for slide in presentation.slides:
         for shape in slide.shapes:
@@ -91,26 +66,88 @@ def edit_powerpoint():
                 continue
 
             for paragraph in shape.text_frame.paragraphs:
-                original_text = "".join(run.text for run in paragraph.runs)
+                text = "".join(run.text for run in paragraph.runs)
 
-                if not original_text.strip():
-                    continue
+                if text.strip():
+                    paragraphs.append({
+                        "id": len(paragraphs),
+                        "text": text,
+                        "paragraph": paragraph
+                    })
 
-                corrected_text = correct_text(original_text)
+    return paragraphs
 
-                if corrected_text != original_text and paragraph.runs:
-                    paragraph.runs[0].text = corrected_text
+
+def proofread_batch(items):
+    payload = [
+        {"id": item["id"], "text": item["text"]}
+        for item in items
+    ]
+
+    response = client.responses.create(
+        model="gpt-5-mini",
+        instructions=SYSTEM_PROMPT,
+        input=json.dumps(payload, ensure_ascii=False),
+    )
+
+    result = json.loads(response.output_text)
+
+    return result["items"]
+
+
+@app.route("/edit", methods=["POST"])
+def edit_powerpoint():
+    try:
+        if "file" not in request.files:
+            return jsonify({"error": "No PowerPoint file received"}), 400
+
+        if not os.environ.get("OPENAI_API_KEY"):
+            return jsonify({"error": "OPENAI_API_KEY is not configured"}), 500
+
+        uploaded_file = request.files["file"]
+        presentation = Presentation(uploaded_file)
+
+        paragraphs = collect_paragraphs(presentation)
+
+        batch_size = 40
+
+        for start in range(0, len(paragraphs), batch_size):
+            batch = paragraphs[start:start + batch_size]
+            corrections = proofread_batch(batch)
+
+            correction_map = {
+                item["id"]: item["text"]
+                for item in corrections
+            }
+
+            for item in batch:
+                corrected = correction_map.get(item["id"], item["text"])
+                paragraph = item["paragraph"]
+
+                if corrected != item["text"] and paragraph.runs:
+                    paragraph.runs[0].text = corrected
 
                     for run in paragraph.runs[1:]:
                         run.text = ""
 
-    output = io.BytesIO()
-    presentation.save(output)
-    output.seek(0)
+        output = io.BytesIO()
+        presentation.save(output)
+        output.seek(0)
 
-    return send_file(
-        output,
-        as_attachment=True,
-        download_name="corrected-powerpoint.pptx",
-        mimetype="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    )
+        original_name = uploaded_file.filename or "presentation.pptx"
+
+        if original_name.lower().endswith(".pptx"):
+            new_name = original_name[:-5] + " - Corrected.pptx"
+        else:
+            new_name = "Corrected PowerPoint.pptx"
+
+        return send_file(
+            output,
+            as_attachment=True,
+            download_name=new_name,
+            mimetype="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
+
+    except Exception as e:
+        print(f"ERROR: {repr(e)}", flush=True)
+        return jsonify({"error": str(e)}), 500
